@@ -1,0 +1,538 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // =====================================================
+    // COMMON FUNCTIONS
+    // =====================================================
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function hasProfile() {
+      return signedIn()
+        && exists(/databases/$(database)/documents/users/$(request.auth.uid));
+    }
+
+    function myProfile() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+
+    // A blocked account (admin set blocked: true) cannot write anything.
+    function notBlocked() {
+      return myProfile().get("blocked", false) != true;
+    }
+
+    function isAdmin() {
+      return hasProfile() && myProfile().role == "admin";
+    }
+
+    function isNGO() {
+      return hasProfile() && myProfile().role == "ngo" && notBlocked();
+    }
+
+    function isDonor() {
+      return hasProfile() && myProfile().role == "donor" && notBlocked();
+    }
+
+    // Text helpers
+    function str(v, max) {
+      return v is string && v.size() > 0 && v.size() <= max;
+    }
+
+    function strOpt(v, max) {
+      return v is string && v.size() <= max;
+    }
+
+    // =====================================================
+    // USER PROFILES
+    // =====================================================
+
+    match /users/{userId} {
+
+      // A new user creates only their own donor / NGO profile.
+      allow create: if signedIn()
+        && request.auth.uid == userId
+        && request.resource.data.keys().hasOnly([
+          "name", "email", "role", "phone",
+          "address", "pickupInstructions", "createdAt"
+        ])
+        && request.resource.data.role in ["donor", "ngo"]
+        && str(request.resource.data.name, 100)
+        && request.resource.data.email.lower() == request.auth.token.email.lower();
+
+      // Own profile, or admin can read any profile.
+      allow get: if signedIn()
+        && (request.auth.uid == userId || isAdmin());
+
+      allow list: if isAdmin();
+
+      // User edits only safe fields of their own profile.
+      allow update: if signedIn()
+        && request.auth.uid == userId
+        && resource.data.get("blocked", false) != true
+        && request.resource.data.role == resource.data.role
+        && request.resource.data.email == resource.data.email
+        && request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(["name", "phone", "address", "pickupInstructions"])
+        && str(request.resource.data.name, 100)
+        && strOpt(request.resource.data.get("phone", ""), 40)
+        && strOpt(request.resource.data.get("address", ""), 600)
+        && strOpt(request.resource.data.get("pickupInstructions", ""), 600);
+
+      // Admin can block / unblock a donor or NGO (never another admin).
+      allow update: if isAdmin()
+        && resource.data.role != "admin"
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(["blocked"])
+        && request.resource.data.blocked is bool;
+
+      allow delete: if false;
+    }
+
+    // =====================================================
+    // FOOD DONATIONS
+    // =====================================================
+
+    match /donations/{donationId} {
+
+      // Donor sees only their own donations. NGOs and admin see all
+      // (NGOs need the list to accept food). Phone and exact address
+      // are NOT stored here: they live in the private sub-document.
+      allow read: if isAdmin()
+        || isNGO()
+        || (hasProfile() && resource.data.donorId == request.auth.uid);
+
+      // DONOR POSTS A DONATION (public part only)
+      allow create: if isDonor()
+        && request.resource.data.keys().hasOnly([
+          "foodName", "imageUrl", "quantity", "category", "area",
+          "approxLat", "approxLng", "deadline", "expiryDate",
+          "notes", "donorId", "donorName", "status", "acceptedBy",
+          "ngoName", "ngoAddress", "ngoContact", "ngoPickupInstructions",
+          "createdAt"
+        ])
+        && request.resource.data.keys().hasAll([
+          "foodName", "imageUrl", "quantity", "category", "area",
+          "deadline", "expiryDate", "donorId", "donorName",
+          "status", "createdAt"
+        ])
+        && request.resource.data.donorId == request.auth.uid
+        && request.resource.data.status == "available"
+        && request.resource.data.get("acceptedBy", null) == null
+        && str(request.resource.data.foodName, 120)
+        && str(request.resource.data.imageUrl, 500)
+        && request.resource.data.imageUrl.startsWith("https://res.cloudinary.com/tk0kzjdf/")
+        && str(request.resource.data.quantity, 80)
+        && str(request.resource.data.category, 40)
+        && str(request.resource.data.area, 120)
+        && (request.resource.data.get("approxLat", null) == null
+            || request.resource.data.approxLat is number)
+        && (request.resource.data.get("approxLng", null) == null
+            || request.resource.data.approxLng is number)
+        && str(request.resource.data.deadline, 32)
+        && str(request.resource.data.expiryDate, 10)
+        && strOpt(request.resource.data.get("notes", ""), 1000)
+        && str(request.resource.data.donorName, 100)
+        && request.resource.data.createdAt == request.time;
+
+      allow update: if signedIn() && (
+
+        // ---------- NGO ACCEPTS ----------
+        (
+          isNGO()
+          && resource.data.status == "available"
+          && request.resource.data.status == "accepted"
+          && request.resource.data.acceptedBy == request.auth.uid
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            "status", "acceptedBy", "ngoName", "ngoAddress",
+            "ngoContact", "ngoPickupInstructions", "acceptedAt"
+          ])
+        )
+
+        ||
+
+        // ---------- NGO SCHEDULES PICKUP ----------
+        (
+          isNGO()
+          && resource.data.status == "accepted"
+          && resource.data.acceptedBy == request.auth.uid
+          && request.resource.data.status == "accepted"
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            "pickupDateTime", "pickupScheduledAt", "pickupNote", "pickupConfirmed"
+          ])
+          && str(request.resource.data.pickupDateTime, 40)
+          && str(request.resource.data.pickupScheduledAt, 100)
+          && strOpt(request.resource.data.pickupNote, 500)
+          && request.resource.data.pickupConfirmed == false
+        )
+
+        ||
+
+        // ---------- NGO RELEASES AN ACCEPTED DONATION ----------
+        (
+          isNGO()
+          && resource.data.status == "accepted"
+          && resource.data.acceptedBy == request.auth.uid
+          && request.resource.data.status == "available"
+          && request.resource.data.get("acceptedBy", null) == null
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            "status", "acceptedBy", "ngoName", "ngoAddress", "ngoContact",
+            "ngoPickupInstructions", "pickupDateTime", "pickupScheduledAt",
+            "pickupNote", "pickupConfirmed", "releasedAt"
+          ])
+        )
+
+        ||
+
+        // ---------- NGO PROFILE RENAME (syncs ngoName on its own donations) ----------
+        (
+          isNGO()
+          && resource.data.acceptedBy == request.auth.uid
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(["ngoName"])
+          && str(request.resource.data.ngoName, 100)
+        )
+
+        ||
+
+        // ---------- DONOR CONFIRMS PICKUP TIME ----------
+        (
+          isDonor()
+          && resource.data.donorId == request.auth.uid
+          && resource.data.status == "accepted"
+          && request.resource.data.status == "accepted"
+          && resource.data.pickupScheduledAt is string
+          && request.resource.data.pickupScheduledAt == resource.data.pickupScheduledAt
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(["pickupConfirmed"])
+          && request.resource.data.pickupConfirmed == true
+        )
+
+        ||
+
+        // ---------- DONOR MARKS COMPLETED ----------
+        (
+          isDonor()
+          && resource.data.donorId == request.auth.uid
+          && resource.data.status == "accepted"
+          && request.resource.data.status == "completed"
+          && request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(["status", "completedAt"])
+        )
+
+        ||
+
+        // ---------- DONOR EDITS AN AVAILABLE DONATION ----------
+        (
+          isDonor()
+          && resource.data.donorId == request.auth.uid
+          && resource.data.status == "available"
+          && request.resource.data.status == "available"
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            "foodName", "quantity", "category", "area", "approxLat",
+            "approxLng", "deadline", "expiryDate", "notes", "editedAt"
+          ])
+          && str(request.resource.data.foodName, 120)
+          && str(request.resource.data.quantity, 80)
+          && str(request.resource.data.category, 40)
+          && str(request.resource.data.area, 120)
+          && str(request.resource.data.deadline, 32)
+          && str(request.resource.data.expiryDate, 10)
+          && strOpt(request.resource.data.get("notes", ""), 1000)
+        )
+
+        ||
+
+        // ---------- DONOR CANCELS AN AVAILABLE DONATION ----------
+        (
+          isDonor()
+          && resource.data.donorId == request.auth.uid
+          && resource.data.status == "available"
+          && request.resource.data.status == "cancelled"
+          && request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(["status", "cancelledAt"])
+        )
+
+        ||
+
+        // ---------- ADMIN REMOVES A DONATION ----------
+        (
+          isAdmin()
+          && resource.data.status in ["available", "accepted"]
+          && request.resource.data.status == "removed"
+          && request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(["status", "removedAt"])
+        )
+
+        ||
+
+        // ---------- ADMIN SECURES OLD DONATIONS ----------
+        // Moves phone / exact address out of the public document.
+        (
+          isAdmin()
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+            "area", "approxLat", "approxLng",
+            "location", "contact", "latitude", "longitude"
+          ])
+          && !("location" in request.resource.data)
+          && !("contact" in request.resource.data)
+          && !("latitude" in request.resource.data)
+          && !("longitude" in request.resource.data)
+        )
+      );
+
+      allow delete: if false;
+
+      // ---------------------------------------------------
+      // PRIVATE DONOR EMAIL (used for EmailJS notifications)
+      // ---------------------------------------------------
+      match /private/{privateDoc} {
+
+        // Donor saves private details: email, phone, exact address.
+        allow create: if isDonor()
+          && privateDoc == "contact"
+          && request.resource.data.keys().hasOnly([
+            "donorId", "donorEmail", "createdAt",
+            "location", "contact", "latitude", "longitude"
+          ])
+          && request.resource.data.keys().hasAll([
+            "donorId", "donorEmail", "createdAt", "location", "contact"
+          ])
+          && request.resource.data.donorId == request.auth.uid
+          && str(request.resource.data.donorEmail, 200)
+          && str(request.resource.data.location, 600)
+          && str(request.resource.data.contact, 40)
+          && (request.resource.data.get("latitude", null) == null
+              || request.resource.data.latitude is number)
+          && (request.resource.data.get("longitude", null) == null
+              || request.resource.data.longitude is number)
+          && get(/databases/$(database)/documents/donations/$(donationId)).data.donorId
+            == request.auth.uid;
+
+        // Donor edits private details while the donation is still available.
+        allow update: if isDonor()
+          && privateDoc == "contact"
+          && resource.data.donorId == request.auth.uid
+          && get(/databases/$(database)/documents/donations/$(donationId)).data.donorId
+            == request.auth.uid
+          && get(/databases/$(database)/documents/donations/$(donationId)).data.status
+            == "available"
+          && request.resource.data.diff(resource.data).affectedKeys()
+            .hasOnly(["location", "contact", "latitude", "longitude"])
+          && str(request.resource.data.location, 600)
+          && str(request.resource.data.contact, 40)
+          && (request.resource.data.get("latitude", null) == null
+              || request.resource.data.latitude is number)
+          && (request.resource.data.get("longitude", null) == null
+              || request.resource.data.longitude is number);
+
+        // Admin maintenance only (securing old donations).
+        allow create, update: if isAdmin()
+          && privateDoc == "contact"
+          && request.resource.data.keys().hasOnly([
+            "donorId", "donorEmail", "createdAt",
+            "location", "contact", "latitude", "longitude"
+          ]);
+
+        // Donor, the accepting NGO, or admin can read.
+        allow get: if signedIn()
+          && privateDoc == "contact"
+          && (
+            resource.data.donorId == request.auth.uid
+            || get(/databases/$(database)/documents/donations/$(donationId)).data.acceptedBy
+              == request.auth.uid
+            || isAdmin()
+          );
+
+        allow list, delete: if false;
+      }
+    }
+
+    // =====================================================
+    // PUBLIC HOMEPAGE STATISTICS
+    // Admin can write anything. Everyone else can only bump the
+    // counters by a small amount, so numbers cannot be faked.
+    // =====================================================
+
+    match /publicStats/{statsId} {
+
+      function statDelta(field, maxDelta) {
+        return !(field in request.resource.data.diff(resource.data).affectedKeys())
+          || (
+            request.resource.data[field] is number
+            && request.resource.data[field] >= resource.data.get(field, 0)
+            && request.resource.data[field] - resource.data.get(field, 0) <= maxDelta
+          );
+      }
+
+      allow read: if statsId == "community";
+
+      allow create: if statsId == "community"
+        && (
+          isAdmin()
+          || (
+            signedIn()
+            && request.resource.data.keys().hasOnly([
+              "totalDonors", "totalNGOs", "totalDonations",
+              "completedDonations", "mealPortionsReported",
+              "recentDonations", "updatedAt"
+            ])
+            && request.resource.data.get("totalDonors", 0) <= 1
+            && request.resource.data.get("totalNGOs", 0) <= 1
+            && request.resource.data.get("totalDonations", 0) <= 1
+            && request.resource.data.get("completedDonations", 0) <= 1
+            && request.resource.data.get("mealPortionsReported", 0) <= 10000
+          )
+        );
+
+      allow update: if statsId == "community"
+        && signedIn()
+        && (
+          isAdmin()
+          || (
+            request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+              "totalDonors", "totalNGOs", "totalDonations",
+              "completedDonations", "mealPortionsReported",
+              "recentDonations", "updatedAt"
+            ])
+            && statDelta("totalDonors", 1)
+            && statDelta("totalNGOs", 1)
+            && statDelta("totalDonations", 1)
+            && statDelta("completedDonations", 1)
+            && statDelta("mealPortionsReported", 10000)
+            && (
+              !("recentDonations" in request.resource.data.diff(resource.data).affectedKeys())
+              || (
+                request.resource.data.recentDonations is list
+                && request.resource.data.recentDonations.size() <= 200
+                && request.resource.data.recentDonations.size()
+                  <= resource.data.get("recentDonations", []).size() + 1
+              )
+            )
+          )
+        );
+
+      allow delete: if false;
+    }
+
+    // =====================================================
+    // DONOR - NGO CHAT
+    // =====================================================
+
+    match /chatMessages/{messageId} {
+
+      // Participants (and admin, for dispute handling) can read.
+      allow read: if signedIn()
+        && (
+          resource.data.donorId == request.auth.uid
+          || resource.data.ngoId == request.auth.uid
+          || isAdmin()
+        );
+
+      allow create: if signedIn()
+        && hasProfile()
+        && notBlocked()
+        && request.resource.data.keys().hasOnly([
+          "donationId", "donorId", "ngoId", "senderId",
+          "senderName", "text", "createdAt"
+        ])
+        && request.resource.data.senderId == request.auth.uid
+        && str(request.resource.data.text, 1000)
+        && strOpt(request.resource.data.senderName, 100)
+        && request.resource.data.donationId is string
+        && request.resource.data.createdAt == request.time
+        && exists(/databases/$(database)/documents/donations/$(request.resource.data.donationId))
+        && get(/databases/$(database)/documents/donations/$(request.resource.data.donationId))
+          .data.status in ["accepted", "completed"]
+        && request.resource.data.donorId
+          == get(/databases/$(database)/documents/donations/$(request.resource.data.donationId)).data.donorId
+        && request.resource.data.ngoId
+          == get(/databases/$(database)/documents/donations/$(request.resource.data.donationId)).data.acceptedBy
+        && (
+          request.auth.uid == request.resource.data.donorId
+          || request.auth.uid == request.resource.data.ngoId
+        );
+
+      allow update, delete: if false;
+    }
+
+    // =====================================================
+    // REPORTS (users report a donation, admin moderates)
+    // =====================================================
+
+    match /reports/{reportId} {
+
+      allow create: if signedIn()
+        && hasProfile()
+        && notBlocked()
+        && request.resource.data.keys().hasOnly([
+          "donationId", "foodName", "donorId", "reporterId", "reporterName",
+          "reporterRole", "reason", "details", "status", "createdAt"
+        ])
+        && request.resource.data.reporterId == request.auth.uid
+        && request.resource.data.status == "open"
+        && str(request.resource.data.reason, 120)
+        && strOpt(request.resource.data.get("details", ""), 500)
+        && request.resource.data.donationId is string
+        && request.resource.data.createdAt == request.time;
+
+      allow read: if isAdmin();
+
+      allow update: if isAdmin()
+        && request.resource.data.diff(resource.data).affectedKeys()
+          .hasOnly(["status", "resolvedAt"])
+        && request.resource.data.status in ["resolved", "dismissed"];
+
+      allow delete: if false;
+    }
+
+    // =====================================================
+    // RATINGS (one rating per person per completed donation)
+    // Document id must be  <donationId>_<raterUid>
+    // =====================================================
+
+    match /ratings/{ratingId} {
+
+      allow create: if signedIn()
+        && hasProfile()
+        && notBlocked()
+        && request.resource.data.keys().hasOnly([
+          "donationId", "foodName", "raterId", "raterName", "raterRole",
+          "rateeId", "rateeName", "stars", "comment", "createdAt"
+        ])
+        && request.resource.data.raterId == request.auth.uid
+        && request.resource.data.donationId is string
+        && ratingId == request.resource.data.donationId + "_" + request.auth.uid
+        && request.resource.data.stars is int
+        && request.resource.data.stars >= 1
+        && request.resource.data.stars <= 5
+        && strOpt(request.resource.data.get("comment", ""), 300)
+        && request.resource.data.createdAt == request.time
+        && get(/databases/$(database)/documents/donations/$(request.resource.data.donationId))
+          .data.status == "completed"
+        && (
+          (
+            request.auth.uid
+              == get(/databases/$(database)/documents/donations/$(request.resource.data.donationId)).data.donorId
+            && request.resource.data.rateeId
+              == get(/databases/$(database)/documents/donations/$(request.resource.data.donationId)).data.acceptedBy
+          )
+          ||
+          (
+            request.auth.uid
+              == get(/databases/$(database)/documents/donations/$(request.resource.data.donationId)).data.acceptedBy
+            && request.resource.data.rateeId
+              == get(/databases/$(database)/documents/donations/$(request.resource.data.donationId)).data.donorId
+          )
+        );
+
+      // Rater sees own ratings; admin sees all.
+      allow read: if signedIn()
+        && (resource.data.raterId == request.auth.uid || isAdmin());
+
+      // Ratings are final.
+      allow update, delete: if false;
+    }
+
+  }
+}
