@@ -46,6 +46,11 @@ service cloud.firestore {
       return v is string && v.size() <= max;
     }
 
+    // The app reads this marker to detect which rules version is live.
+    match /rulesVersion/{versionId} {
+      allow get: if versionId == "r5";
+    }
+
     // =====================================================
     // USER PROFILES
     // =====================================================
@@ -123,7 +128,7 @@ service cloud.firestore {
         && request.resource.data.get("acceptedBy", null) == null
         && str(request.resource.data.foodName, 120)
         && str(request.resource.data.imageUrl, 500)
-        && request.resource.data.imageUrl.startsWith("https://res.cloudinary.com/tk0kzjdf/")
+        && request.resource.data.imageUrl.matches("https://res[.]cloudinary[.]com/tk0kzjdf/.*")
         && str(request.resource.data.quantity, 80)
         && str(request.resource.data.category, 40)
         && str(request.resource.data.area, 120)
@@ -306,7 +311,7 @@ service cloud.firestore {
               || request.resource.data.latitude is number)
           && (request.resource.data.get("longitude", null) == null
               || request.resource.data.longitude is number)
-          && get(/databases/$(database)/documents/donations/$(donationId)).data.donorId
+          && getAfter(/databases/$(database)/documents/donations/$(donationId)).data.donorId
             == request.auth.uid;
 
         // Donor edits private details while the donation is still available.
