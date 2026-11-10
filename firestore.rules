@@ -12,7 +12,9 @@ service cloud.firestore {
     }
 
     function hasProfile() {
+      // The app already signs out unverified emails; this enforces it on the server too.
       return signedIn()
+        && request.auth.token.email_verified == true
         && exists(/databases/$(database)/documents/users/$(request.auth.uid));
     }
 
@@ -30,7 +32,10 @@ service cloud.firestore {
     }
 
     function isNGO() {
-      return hasProfile() && myProfile().role == "ngo" && notBlocked();
+      // An NGO acts only after an admin has verified it (users/{uid}.verified == true).
+      // Users can never set "verified" themselves (not allowed on create or update).
+      return hasProfile() && myProfile().role == "ngo" && notBlocked()
+        && myProfile().get("verified", false) == true;
     }
 
     function isDonor() {
@@ -48,7 +53,7 @@ service cloud.firestore {
 
     // The app reads this marker to detect which rules version is live.
     match /rulesVersion/{versionId} {
-      allow get: if versionId == "r5";
+      allow get: if versionId == "r7";
     }
 
     // =====================================================
@@ -87,11 +92,15 @@ service cloud.firestore {
         && strOpt(request.resource.data.get("address", ""), 600)
         && strOpt(request.resource.data.get("pickupInstructions", ""), 600);
 
-      // Admin can block / unblock a donor or NGO (never another admin).
+      // Admin can block / unblock and verify / unverify a donor or NGO
+      // (never another admin).
       allow update: if isAdmin()
         && resource.data.role != "admin"
-        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(["blocked"])
-        && request.resource.data.blocked is bool;
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(["blocked", "verified"])
+        && (!("blocked" in request.resource.data.diff(resource.data).affectedKeys())
+            || request.resource.data.blocked is bool)
+        && (!("verified" in request.resource.data.diff(resource.data).affectedKeys())
+            || (resource.data.role == "ngo" && request.resource.data.verified is bool));
 
       allow delete: if false;
     }
@@ -370,6 +379,28 @@ service cloud.firestore {
           );
       }
 
+      // Like statDelta, but also lets the count go down by 1 (a donor cancelling).
+      function statAdjust(field) {
+        return !(field in request.resource.data.diff(resource.data).affectedKeys())
+          || (
+            request.resource.data[field] is number
+            && request.resource.data[field] >= 0
+            && request.resource.data[field] >= resource.data.get(field, 0) - 1
+            && request.resource.data[field] <= resource.data.get(field, 0) + 1
+          );
+      }
+
+      // A verified NGO can see every donation, so it may publish exact donation
+      // totals (not user counts). Values are range-checked.
+      function ngoStatOk(field) {
+        return !(field in request.resource.data.diff(resource.data).affectedKeys())
+          || (
+            request.resource.data[field] is number
+            && request.resource.data[field] >= 0
+            && request.resource.data[field] <= 1000000
+          );
+      }
+
       allow read: if statsId == "community";
 
       allow create: if statsId == "community"
@@ -395,6 +426,23 @@ service cloud.firestore {
         && (
           isAdmin()
           || (
+            isNGO()
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+              "totalDonations", "completedDonations", "mealPortionsReported",
+              "recentDonations", "updatedAt"
+            ])
+            && ngoStatOk("totalDonations")
+            && ngoStatOk("completedDonations")
+            && ngoStatOk("mealPortionsReported")
+            && (
+              !("recentDonations" in request.resource.data.diff(resource.data).affectedKeys())
+              || (
+                request.resource.data.recentDonations is list
+                && request.resource.data.recentDonations.size() <= 10
+              )
+            )
+          )
+          || (
             request.resource.data.diff(resource.data).affectedKeys().hasOnly([
               "totalDonors", "totalNGOs", "totalDonations",
               "completedDonations", "mealPortionsReported",
@@ -402,7 +450,7 @@ service cloud.firestore {
             ])
             && statDelta("totalDonors", 1)
             && statDelta("totalNGOs", 1)
-            && statDelta("totalDonations", 1)
+            && statAdjust("totalDonations")
             && statDelta("completedDonations", 1)
             && statDelta("mealPortionsReported", 10000)
             && (
