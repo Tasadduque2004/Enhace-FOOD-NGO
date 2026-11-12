@@ -60,10 +60,27 @@ service cloud.firestore {
     // USER PROFILES
     // =====================================================
 
+    // =====================================================
+    // PENDING SIGN-UPS (profile kept here until the email is verified;
+    // the admin cannot read this collection)
+    // =====================================================
+
+    match /pendingUsers/{userId} {
+      allow create: if signedIn()
+        && request.auth.uid == userId
+        && request.resource.data.keys().hasOnly(["name", "email", "role", "createdAt"])
+        && request.resource.data.role in ["donor", "ngo"]
+        && str(request.resource.data.name, 100)
+        && request.resource.data.email.lower() == request.auth.token.email.lower();
+      allow get, delete: if signedIn() && request.auth.uid == userId;
+      allow list, update: if false;
+    }
+
     match /users/{userId} {
 
       // A new user creates only their own donor / NGO profile.
       allow create: if signedIn()
+        && request.auth.token.email_verified == true
         && request.auth.uid == userId
         && request.resource.data.keys().hasOnly([
           "name", "email", "role", "phone",
